@@ -1,9 +1,11 @@
 from dotenv import load_dotenv
 import os
+import uuid
 
 from langchain.chat_models import init_chat_model
 from langgraph.graph import MessagesState, StateGraph, END, START
-
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.pregel.main import Checkpointer #can use SQLLite and Postgress too
 load_dotenv()
 
 llm = init_chat_model(model="z-ai/glm-4.5-air:free", model_provider="openai") # using a free model from z-ai using openrouter
@@ -17,8 +19,11 @@ graph_builder.add_node("prompt_llm", prompt_llm) # langgraph graph always starts
 graph_builder.add_edge(START, 'prompt_llm')
 graph_builder.add_edge('prompt_llm', END)
 
-graph = graph_builder.compile()
+checkpointer = InMemorySaver()
+graph = graph_builder.compile(checkpointer=checkpointer)
 
-user_input = input("Enter your message: ")
-result = graph.invoke({"messages": [{"role": "user", "content": user_input}]})
-print(result)
+config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+while True:
+    user_input = input("Enter your message: ")
+    result = graph.invoke({"messages": [{"role": "user", "content": user_input}]}, config=config)
+    print(result)
