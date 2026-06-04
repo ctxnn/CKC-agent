@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import os
 from typing import TypedDict, Annotated, Literal
 import uuid
+import subprocess
 from pydantic import BaseModel, Field
 
 from langchain.chat_models import init_chat_model
@@ -15,6 +16,7 @@ from langchain_core.documents import Document
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import InMemorySaver #can use SQLLite and Postgress too
+from langgraph.types import interrupt, Command 
 load_dotenv()
 
 llm = init_chat_model(model="z-ai/glm-4.5-air:free", model_provider="openai") # using a free model from z-ai using openrouter
@@ -55,6 +57,8 @@ class State(TypedDict):
     messages: Annotated[list, add_messages]
     message_intent: str | None
 
+    next_node: str | None
+
 def classify_intent(state: State) -> dict:
     structured_llm = llm.with_structured_output(IntentClassifier, method="json_mode")
     result = structured_llm.invoke([
@@ -63,6 +67,21 @@ def classify_intent(state: State) -> dict:
     ])
     return {"message_intent": result.message_intent}
 
+def accept_coding(state: State) -> dict:
+    user_prompt = state["messages"][-1].content
+    decision = interrupt(f"we areabout to run opencode with request: {user_prompt}\n\naccept the above request to continue? \n\ntype yes, no or a modification")
+
+    text = str(decision).strip().lower() 
+
+    if text in ["yes","no", 'approve', 'ok', 'okay', 'go', 'run', 'proceed', 'accept', 'y', 'yes', 'ok', 'okay', 'go', 'run', 'proceed', 'accept']:
+        return {'next_node': 'prompt_llm_code'}
+    
+    if text in ['n', 'no', 'disapprove', 'deny', 'disallow', 'decline', 'stop', 'wait', 'dont run', 'exit', 'e', 'no', 'disapprove', 'deny', 'disallow', 'decline', 'stop', 'wait', 'dont run', 'exit']:
+        return {"messages": [{'role': 'assistant', 'content': 'Coding request denied by user.'}], 'next_node': 'denied'}
+
+    return {"messages": [{'role': 'assistant', 'content': text}], 'next_node': 'accept_coding'}
+    
+    
 def prompt_llm_chat(state: State) -> dict:
     messages = [{'role': 'system', 'content': 'You are a helpful assistant.'}] + state["messages"]
     response = llm.invoke(messages)
@@ -78,9 +97,29 @@ def prompt_llm_rag(state: State) -> dict:
     return {"messages":{'role': 'assistant', 'content': response.content}}
 
 def prompt_llm_code(state: State) -> dict:
-    messages = [{'role': 'system', 'content': 'no matter what the user says, always respond with "i am the code agent"'}] + state["messages"]
-    response = llm.invoke(messages)
-    return {"messages":{'role': 'assistant', 'content': response.content}}
+    user_prompt = state['messages'][-1].content 
+    workspace = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
+    
+    # Option A: Using OpenCode (Default)
+    opencode_path = os.path.expanduser('~/.opencode/bin/opencode')
+    result = subprocess.run(
+        [opencode_path, 'run', user_prompt, '--dangerously-skip-permissions'], 
+        cwd=workspace,
+        text=True,
+        capture_output=True,
+    )
+    
+    # Option B: Using Claude Code (Alternative)
+    # To use Claude Code instead, make sure it is installed globally and uncomment this:
+    # result = subprocess.run(
+    #     ['claude', '-p', user_prompt, '--permission-mode', 'accept-edits'], 
+    #     cwd=workspace,
+    #     text=True,
+    #     capture_output=True,
+    # )
+    
+    output = result.stdout.strip() or result.stderr.strip()
+    return {"messages":{'role': 'assistant', 'content': output}}
 
 graph_builder = StateGraph(State)
 
@@ -88,9 +127,12 @@ graph_builder.add_node("classify_intent", classify_intent)
 graph_builder.add_node("prompt_llm_chat", prompt_llm_chat)
 graph_builder.add_node("prompt_llm_rag", prompt_llm_rag)
 graph_builder.add_node("prompt_llm_code", prompt_llm_code)
+graph_builder.add_node('accept_coding', accept_coding)
+
+graph_builder.add_conditional_edges('accept_coding', lambda state: 'end' if state.get('next_node') == 'denied' else state['next_node'], {'end': END, 'prompt_llm_code': 'prompt_llm_code', 'accept_coding':'accept_coding'})
 
 graph_builder.add_edge(START, "classify_intent")
-graph_builder.add_conditional_edges("classify_intent",lambda state: state["message_intent"], {'chat':'prompt_llm_chat', 'knowledge': 'prompt_llm_rag', 'code': 'prompt_llm_code'})
+graph_builder.add_conditional_edges("classify_intent",lambda state: state["message_intent"], {'chat':'prompt_llm_chat', 'knowledge': 'prompt_llm_rag', 'code': 'accept_coding'})
 
 graph_builder.add_edge("prompt_llm_chat", END)
 graph_builder.add_edge("prompt_llm_rag", END)
@@ -99,11 +141,19 @@ graph_builder.add_edge("prompt_llm_code", END)
 checkpointer = InMemorySaver()
 graph = graph_builder.compile(checkpointer=checkpointer)
 
+graph.get_graph().draw_mermaid_png(output_file_path='agent_graph_after_looping_with_HIL.png')
+
 config = {'configurable': {'thread_id': str(uuid.uuid4())}}
 
 while True: 
     user_input = input("User: ")
     result = graph.invoke({'messages':[{'role':'user', 'content': user_input}]}, config)
+
+    while '__interrupt__' in result: 
+        prompt = result['__interrupt__'][0].value
+        decision = input(f'{prompt}\n\nContinue? Y/N: ')
+        result = graph.invoke(Command(resume=decision), config)
+        
     print("Bot:", result['messages'][-1].content)
 
     
